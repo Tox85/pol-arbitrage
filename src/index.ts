@@ -199,42 +199,39 @@ async function main() {
     maxDistanceFromMid: MAX_DISTANCE_FROM_MID
   };
 
-  // Démarrer le market making sur chaque marché sélectionné
-  const marketMakers: MarketMaker[] = [];
-  let activeMarketMakers = 0;
+  // ===================================================================
+  // MULTI-MARKET : Gérer K marchés simultanés (MAX_ACTIVE_MARKETS)
+  // ===================================================================
   
-  for (const market of picked) {
-    log.info({ 
-      market: market.slug, 
-      volume: market.volume24hrClob,
-      yesToken: market.yesTokenId.substring(0, 20) + '...',
-      noToken: market.noTokenId.substring(0, 20) + '...'
-    }, "🎯 Démarrer market making");
-
-    const marketMaker = new MarketMaker(mmConfig);
-    marketMakers.push(marketMaker);
+  const marketMakers: MarketMaker[] = [];
+  const marketsToRun = picked.slice(0, MAX_ACTIVE_MARKETS); // Top K marchés
+  
+  log.info({ 
+    totalEligible: picked.length,
+    marketsSelected: marketsToRun.length,
+    maxActive: MAX_ACTIVE_MARKETS
+  }, "📊 Multi-market configuration");
+  
+  // Démarrer les K meilleurs marchés en parallèle
+  for (const market of marketsToRun) {
+    const mm = new MarketMaker(mmConfig);
+    marketMakers.push(mm);
     
-    // Démarrer le market making (ne pas attendre)
-    marketMaker.start(market).then(() => {
-      activeMarketMakers++;
-      log.info({ 
-        market: market.slug,
-        activeMarketMakers 
-      }, "✅ Market maker démarré avec succès");
-    }).catch(error => {
-      log.error({ error, market: market.slug }, "❌ Erreur dans le market making - tentative marché suivant si disponible");
-      
-      // Si aucun market maker n'est actif, essayer de démarrer le prochain marché disponible
-      if (activeMarketMakers === 0 && picked.indexOf(market) < picked.length - 1) {
-        log.info("🔄 Tentative de démarrage du marché suivant...");
-      }
+    // Start asynchrone (ne pas bloquer)
+    mm.start(market).catch(error => {
+      log.error({ error, market: market.slug }, "❌ Market maker failed");
     });
+    
+    log.info({ 
+      market: market.slug,
+      vol24h: market.volume24hrClob,
+      spread: (market.spread * 100).toFixed(1) + '¢'
+    }, `🎯 Starting MM ${marketMakers.length}/${MAX_ACTIVE_MARKETS}`);
   }
 
   log.info({ 
-    totalMarketMakers: marketMakers.length,
-    config: mmConfig 
-  }, "✅ Market makers en cours de démarrage");
+    activeMarkets: marketMakers.length
+  }, "✅ All market makers starting");
 
   // Gestion propre de l'arrêt (SIGINT = Ctrl+C local)
   process.on('SIGINT', async () => {

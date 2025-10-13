@@ -27,16 +27,17 @@ import {
   PROXY_ADDRESS,
   NOTIONAL_PER_ORDER_USDC,
   MAX_SELL_PER_ORDER_SHARES,
-  MIN_NOTIONAL_SELL_USDC
+  MIN_NOTIONAL_SELL_USDC,
+  MIN_SPREAD_CENTS
 } from "./config";
 import { rootLog } from "./index";
 import { buildAmounts } from "./lib/amounts";
-import { calculateSafeSize, calculateSellSize } from "./risk/sizing";
+import { calculateSafeSize } from "./risk/sizing";
 // enforceMinSize - UNUSED (removed)
 import { calculateSellSizeShares } from "./lib/round";
 // roundPrice, roundSize - UNUSED (removed, using amounts.ts directly)
-import { checkBuySolvency, checkSellSolvency } from "./risk/solvency";
-import { ensurePostOnly, validateQuotePrices, checkParity } from "./lib/quote-guard";
+import { checkBuySolvency } from "./risk/solvency";
+import { ensurePostOnly } from "./lib/quote-guard";
 // readErc20BalanceAllowance - UNUSED (removed, handled in solvency functions)
 import { InventoryManager } from "./inventory";
 import { AllowanceManager } from "./allowanceManager";
@@ -990,7 +991,7 @@ export class MarketMaker {
     
     // Log seulement si on va replacer (réduire bruit)
     if (notInside || priceMovement || orderTooOld) {
-      log.info({
+    log.info({
         ourBid: currentOrders.bidPrice?.toFixed(4),
         mktBid: bestBid.toFixed(4),
         ourAsk: currentOrders.askPrice?.toFixed(4),
@@ -1487,8 +1488,8 @@ export class MarketMaker {
     const midPrice = (bestBid + bestAsk) / 2;
     const rawSpread = bestAsk - bestBid;
     
-    // GARDE-FOU CRITIQUE : Spread minimum (annulation immédiate si breach)
-    const minSpreadRequired = this.config.targetSpreadCents / 100 * 0.6; // 60% du target minimum
+    // GARDE-FOU CRITIQUE : Spread minimum absolu (MIN_SPREAD_CENTS de la config)
+    const minSpreadRequired = MIN_SPREAD_CENTS / 100; // Spread minimum absolu (ex: 4¢ → 0.04)
     if (rawSpread < minSpreadRequired) {
       log.warn({
         tokenId: tokenId.substring(0, 20) + '...',
@@ -1688,28 +1689,13 @@ export class MarketMaker {
       }
     }, "🛡️ Quote guards applied");
     
-    // ============================================================
-    // VALIDATION FINALE : Vérifier que les prix sont cohérents
-    // ============================================================
-    const validation = validateQuotePrices(
-        bidPrice, 
-        askPrice, 
-        bestBid, 
-        bestAsk, 
-      midPrice,
-      this.config.maxDistanceFromMid
-    );
-
-    if (!validation.valid) {
+    // VALIDATION SIMPLE : Bid < Ask (ensurePostOnly garantit déjà la cohérence)
+    if (bidPrice >= askPrice) {
       log.warn({
         tokenId: tokenId.substring(0, 20) + '...',
-        tokenSide,
-        bidPrice: bidPrice.toFixed(4),
-        askPrice: askPrice.toFixed(4),
-        bestBid: bestBid.toFixed(4),
-        bestAsk: bestAsk.toFixed(4),
-        reason: validation.reason
-      }, "❌ Quote validation failed, skipping");
+        bid: bidPrice.toFixed(4),
+        ask: askPrice.toFixed(4)
+      }, "⚠️ Invalid quote: bid >= ask");
       return null;
     }
 

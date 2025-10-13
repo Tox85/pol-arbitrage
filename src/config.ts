@@ -60,7 +60,11 @@ export const AUTO_ADJUST_NOTIONAL = process.env.AUTO_ADJUST_NOTIONAL === 'true';
 // Configuration de la réactivité aux mouvements de prix
 // PRICE_CHANGE_THRESHOLD déjà déclaré plus haut
 export const MAX_DISTANCE_FROM_MID = Number(process.env.MAX_DISTANCE_FROM_MID) || 0.05; // 5¢ - distance max du mid-price
-export const MAX_ACTIVE_MARKETS = Number(process.env.MAX_ACTIVE_MARKETS) || 2; // Nombre maximum de marchés actifs (2 pour avoir un fallback)
+export const MAX_ACTIVE_MARKETS = Number(process.env.MAX_ACTIVE_MARKETS) || 3; // Nombre de marchés actifs simultanés (multi-market)
+
+// Selector dynamique (rescoring top-K)
+export const RESCORE_INTERVAL_MS = Number(process.env.RESCORE_INTERVAL_MS) || 10000; // Rescoring toutes les 10s
+export const FAIL_CYCLES_BEFORE_DROP = Number(process.env.FAIL_CYCLES_BEFORE_DROP) || 3; // Drop marché après 3 cycles échoués
 export const MIN_VOLUME_USDC = Number(process.env.MIN_VOLUME_USDC) || 5000; // Volume minimum 24h en USDC
 export const MIN_SPREAD_CENTS = Number(process.env.MIN_SPREAD_CENTS) || 0.1; // Spread minimum requis en centimes (0.1¢ = très serré, 0.5¢ = large)
 export const MAX_SPREAD_CENTS = Number(process.env.MAX_SPREAD_CENTS) || 10; // Spread maximum accepté en centimes (10¢ = large mais réaliste)
