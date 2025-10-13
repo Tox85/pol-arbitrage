@@ -973,9 +973,10 @@ export class MarketMaker {
   }
 
   private shouldReplaceOrders(currentOrders: any, bestBid: number, bestAsk: number, targetSpread: number): boolean {
-    // Remplacer si nos ordres ne sont plus au top (not inside)
-    const ourBidIsBest = currentOrders.bidPrice && currentOrders.bidPrice >= bestBid;
-    const ourAskIsBest = currentOrders.askPrice && currentOrders.askPrice <= bestAsk;
+    // STRATÉGIE AGRESSIVE : Remplacer si on n'est pas EXACTEMENT au best bid/ask
+    // Pour maximiser capture de spread, être toujours top-of-book
+    const ourBidIsBest = currentOrders.bidPrice && Math.abs(currentOrders.bidPrice - bestBid) < 0.0001;
+    const ourAskIsBest = currentOrders.askPrice && Math.abs(currentOrders.askPrice - bestAsk) < 0.0001;
     const notInside = !ourBidIsBest || !ourAskIsBest;
     
     // Remplacer si le mid-price a bougé significativement

@@ -12,6 +12,7 @@ export class InventoryManager {
   private inventory: Map<string, number> = new Map();
   private maxInventory: number;
   private provider: JsonRpcProvider; // Pour d'éventuelles vérifications on-chain
+  private saveMutex: Promise<void> = Promise.resolve(); // Mutex pour écriture atomique sérialisée
 
   constructor(provider: JsonRpcProvider, maxInventory: number = 100) {
     this.provider = provider;
@@ -42,16 +43,39 @@ export class InventoryManager {
    * Sauvegarde l'inventaire dans un fichier spécifique
    */
   async saveToFile(filePath: string = INVENTORY_PERSISTENCE_FILE): Promise<void> {
-    try {
-      const data: Record<string, number> = {};
-      for (const [tokenId, shares] of this.inventory.entries()) {
-        data[tokenId] = shares;
+    // MUTEX : Sérialiser toutes les écritures pour éviter race conditions
+    this.saveMutex = this.saveMutex.then(async () => {
+      try {
+        const data: Record<string, number> = {};
+        for (const [tokenId, shares] of this.inventory.entries()) {
+          data[tokenId] = shares;
+        }
+        
+        // ÉCRITURE ATOMIQUE : tmp → rename (évite corruption en cas de crash)
+        const tmpFile = `${filePath}.tmp.${Date.now()}`;
+        const content = JSON.stringify(data, null, 2);
+        
+        // 1. Écrire dans fichier temporaire
+        await fs.writeFile(tmpFile, content, 'utf-8');
+        
+        // 2. Rename atomique (garantit cohérence)
+        try {
+          await fs.rename(tmpFile, filePath);
+        } catch (renameError) {
+          // Fallback Windows : supprimer puis rename
+          try {
+            await fs.unlink(filePath);
+          } catch { /* fichier n'existe pas */ }
+          await fs.rename(tmpFile, filePath);
+        }
+        
+        log.debug({ filePath, count: this.inventory.size }, "💾 Inventory saved atomically");
+      } catch (error) {
+        log.error({ error, filePath }, "❌ Failed to save inventory");
       }
-      await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
-      log.debug({ filePath, count: this.inventory.size }, "📦 Inventory saved to file");
-    } catch (error) {
-      log.error({ error, filePath }, "Failed to save inventory");
-    }
+    });
+    
+    await this.saveMutex;
   }
 
   /**

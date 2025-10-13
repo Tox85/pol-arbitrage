@@ -19,7 +19,7 @@ export const TARGET_SPREAD_CENTS = Number(process.env.TARGET_SPREAD_CENTS) || 3;
 export const TICK_IMPROVEMENT = Number(process.env.TICK_IMPROVEMENT) || 1; // 1 tick = 0.1¢ d'amélioration (priorité de file)
 export const NOTIONAL_PER_ORDER_USDC = Number(process.env.NOTIONAL_PER_ORDER_USDC) || 1.5; // Réduit à 1.5$ pour économiser le capital
 export const MAX_ACTIVE_ORDERS = Number(process.env.MAX_ACTIVE_ORDERS) || 100;
-export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 1500;
+export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 500; // Repricing agressif pour capturer spread
 export const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS) || 30000;
 export const PRICE_CHANGE_THRESHOLD = Number(process.env.PRICE_CHANGE_THRESHOLD) || 0.001;
 export const PROXY_ADDRESS = process.env.POLY_PROXY_ADDRESS!;
