@@ -35,7 +35,7 @@ export async function snapshotTop(tokenId: string): Promise<Top> {
  * @param clob Instance du PolyClobClient
  * @returns Prix de la dernière transaction réelle ou null si aucune donnée
  */
-export async function fetchLastTradePrice(tokenId: string, clob: any): Promise<number | null> {
+export async function fetchLastTradePrice(tokenId: string, _clob: any): Promise<number | null> {
   try {
     // Note: L'API CLOB ne fournit pas d'endpoint public pour les trades récents
     // On utilise le mid-price du carnet comme meilleure approximation

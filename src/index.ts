@@ -58,11 +58,10 @@ import {
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
 async function main() {
-  // Validation Zod optionnelle (fail-fast)
-  if (process.env.USE_ZOD_VALIDATION === 'true') {
-    const { parseEnv } = await import("./config/schema");
-    parseEnv(process.env);
-  }
+  // Validation Zod OBLIGATOIRE au boot (fail-fast)
+  // Assure que toutes les variables sont correctes avant de démarrer
+  const { parseEnv } = await import("./config/schema");
+  parseEnv(process.env);
   
   const MIN_VOL = MIN_VOLUME_USDC; // Utiliser la config centralisée
   const MAX = MAX_ACTIVE_MARKETS; // Utiliser la config centralisée
@@ -85,17 +84,17 @@ async function main() {
   // Test de connexion CLOB avec SDK officiel
   try {
     const { PolyClobClient } = await import("./clients/polySDK");
-    const clob = new PolyClobClient(
+    new PolyClobClient(
       process.env.PRIVATE_KEY!,
       process.env.CLOB_API_KEY!,
       process.env.CLOB_API_SECRET!,
       process.env.CLOB_PASSPHRASE!,
       "https://clob.polymarket.com",
-      process.env.POLY_PROXY_ADDRESS // Utiliser le proxy
+      process.env.POLY_PROXY_ADDRESS
     );
-    log.info("✅ Connexion CLOB établie avec Polymarket SDK");
+    log.info("✅ CLOB connected");
   } catch (error) {
-    log.error({ error }, "❌ Erreur de connexion CLOB");
+    log.error({ error }, "❌ CLOB connection failed");
     process.exit(1);
   }
 

@@ -193,7 +193,7 @@ export class PolyClobClient {
    * Récupère les ordres (avec filtres optionnels)
    * Alias pour compatibilité
    */
-  async getOrders(params?: any): Promise<any> {
+  async getOrders(_params?: any): Promise<any> {
     try {
       // Le SDK officiel utilise getOpenOrders, on ajoute un alias
       return await this.client.getOpenOrders();
@@ -215,6 +215,108 @@ export class PolyClobClient {
    */
   getMakerAddress(): string {
     return this.proxyAddress;
+  }
+
+  // ===== NOUVELLES MÉTHODES - MÉTADONNÉES MARCHÉS =====
+
+  /**
+   * Récupère les métadonnées d'un marché depuis CLOB
+   * API: GET /markets (cherche par condition_id)
+   * Retourne: tick_size, min_order_size, end_date, neg_risk
+   */
+  async getMarketMetadata(conditionId: string): Promise<{
+    tickSize: number;
+    minOrderSize: number;
+    negRisk: boolean;
+    endDate?: string;
+  } | null> {
+    try {
+      // Note: Le SDK ne expose pas directement getMarket, on utilise les books
+      const response = await this.client.getMarket(conditionId);
+      
+      if (!response) {
+        return null;
+      }
+
+      return {
+        tickSize: parseFloat(response.minimum_tick_size || response.tick_size || "0.001"),
+        minOrderSize: parseFloat(response.minimum_order_size || response.min_size || "5"),
+        negRisk: response.neg_risk || false,
+        endDate: response.end_date_iso || response.end_date
+      };
+    } catch (error: any) {
+      log.debug({ conditionId: conditionId.substring(0, 20) + '...' }, "Market metadata not available via SDK");
+      return null;
+    }
+  }
+
+  /**
+   * Récupère le tick size pour un token depuis le book
+   * API: GET /book?token_id={token_id}
+   */
+  async getTickSizeForToken(tokenId: string): Promise<number> {
+    try {
+      const book = await this.getOrderBook(tokenId);
+      
+      if (book && book.tick_size) {
+        return parseFloat(book.tick_size);
+      }
+      
+      return 0.001; // Fallback tick size standard
+    } catch (error: any) {
+      return 0.001;
+    }
+  }
+
+  /**
+   * Récupère min_order_size pour un token depuis le book
+   * API: GET /book?token_id={token_id}
+   */
+  async getMinOrderSizeForToken(tokenId: string): Promise<number> {
+    try {
+      const book = await this.getOrderBook(tokenId);
+      
+      if (book && (book.min_order_size || book.minimum_order_size)) {
+        return parseFloat(book.min_order_size || book.minimum_order_size);
+      }
+      
+      return 5; // Fallback minimum Polymarket standard
+    } catch (error: any) {
+      return 5;
+    }
+  }
+
+  /**
+   * Récupère les books pour plusieurs tokens (batch)
+   * Retourne: bestBid, bestAsk, tickSize, minOrderSize par token
+   */
+  async getBooks(tokenIds: string[]): Promise<Map<string, {
+    bestBid: number | null;
+    bestAsk: number | null;
+    tickSize: number;
+    minOrderSize: number;
+  }>> {
+    const result = new Map();
+    
+    for (const tokenId of tokenIds) {
+      try {
+        const book = await this.getOrderBook(tokenId);
+        
+        if (book) {
+          result.set(tokenId, {
+            bestBid: book.bids && book.bids.length > 0 ? parseFloat(book.bids[0].price) : null,
+            bestAsk: book.asks && book.asks.length > 0 ? parseFloat(book.asks[0].price) : null,
+            tickSize: parseFloat(book.tick_size || "0.001"),
+            minOrderSize: parseFloat(book.min_order_size || book.minimum_order_size || "5")
+          });
+        }
+      } catch (error) {
+        // Continuer avec les autres tokens
+        continue;
+      }
+    }
+    
+    return result;
   }
 
   // ===== MÉTHODES UTILITAIRES =====

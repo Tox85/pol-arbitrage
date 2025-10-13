@@ -40,8 +40,9 @@ export class UserFeed {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private isConnecting = false;
+  private conditionIds: string[] = []; // Markets à suivre
   
-  // Auth L2 comme pour REST API
+  // Auth credentials (envoyés dans le message, pas les headers)
   private apiKey: string;
   private apiSecret: string;
   private passphrase: string;
@@ -52,6 +53,13 @@ export class UserFeed {
     this.apiSecret = apiSecret;
     this.passphrase = passphrase;
     this.signingKey = signingKey;
+  }
+
+  /**
+   * Configure les condition IDs à suivre
+   */
+  setMarkets(conditionIds: string[]) {
+    this.conditionIds = conditionIds;
   }
 
   /**
@@ -77,44 +85,42 @@ export class UserFeed {
       url: WSS_USER_URL 
     }, "Connecting to user WebSocket");
 
-    // Générer headers d'authentification L2 (même logique que CustomClobClient)
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const method = "GET";
-    const requestPath = "/ws/user";
-    
-    // HMAC: message = timestamp + method + requestPath
-    const message = `${timestamp}${method}${requestPath}`;
-    
-    // Secret en Base64 → décoder avant de l'utiliser
-    const key = Buffer.from(this.apiSecret, "base64");
-    const hmac = crypto.createHmac("sha256", key);
-    const sigB64 = hmac.update(message).digest("base64");
-    
-    // Base64 URL-safe (conserver les "=")
-    const signature = sigB64.replace(/\+/g, "-").replace(/\//g, "_");
-
-    this.ws = new WebSocket(WSS_USER_URL, {
-      headers: {
-        "POLY_ADDRESS": this.signingKey,
-        "POLY_API_KEY": this.apiKey,
-        "POLY_PASSPHRASE": this.passphrase,
-        "POLY_TIMESTAMP": timestamp,
-        "POLY_SIGNATURE": signature
-      }
-    });
+    // Connexion SANS headers (auth sera envoyée dans un message)
+    this.ws = new WebSocket(WSS_USER_URL);
 
     this.ws.on("open", () => {
       this.isConnecting = false;
       this.reconnectAttempts = 0;
       
-      log.info("✅ User WebSocket connected - ready to receive fills, orders, balance updates");
+      log.info("✅ User WebSocket connected");
       
-      // Ping périodique
+      // CRITIQUE : Envoyer le message d'authentification selon doc Polymarket
+      // Format: { "type": "user", "markets": [...], "auth": {...} }
+      const authMessage = {
+        type: "user",
+        markets: this.conditionIds, // Condition IDs des marchés à suivre
+        auth: {
+          apikey: this.apiKey,
+          secret: this.apiSecret,
+          passphrase: this.passphrase
+        }
+      };
+      
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(authMessage));
+        log.info({ 
+          markets: this.conditionIds.length,
+          conditionIds: this.conditionIds.map(id => id.substring(0, 20) + '...')
+        }, "🔐 Auth message sent to User WebSocket");
+      }
+      
+      // PING périodique toutes les 10s (recommandation Polymarket)
       this.ping = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.ping();
+          this.ws.send("PING");
+          log.debug("🏓 PING sent to User WebSocket");
         }
-      }, 25_000); // Augmenté à 25s comme suggéré
+      }, 10_000); // 10 secondes comme recommandé par Polymarket
     });
 
     this.ws.on("pong", () => {

@@ -9,11 +9,9 @@ const log = pino({ name: "close-orders" });
 
 export class OrderCloser {
   private clob: PolyClobClient;
-  private provider: JsonRpcProvider;
 
-  constructor(clob: PolyClobClient, inventoryManager: any, provider?: JsonRpcProvider) {
+  constructor(clob: PolyClobClient, _inventoryManager: any, _provider?: JsonRpcProvider) {
     this.clob = clob;
-    this.provider = provider || new JsonRpcProvider(RPC_URL);
     log.info("🗑️ OrderCloser initialized");
   }
 

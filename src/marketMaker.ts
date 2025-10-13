@@ -5,13 +5,10 @@ import { MarketFeed } from "./ws/marketFeed";
 import { UserFeed, FillEvent } from "./ws/userFeed";
 import { PnLTracker } from "./metrics/pnl";
 import { 
-  // DECIMALS, PLACE_EVERY_MS - REMOVED (unused)
   USDC_ADDRESS, 
   EXCHANGE_ADDRESS, 
   POLY_PROXY_ADDRESS, 
   RPC_URL,
-  MAX_INVENTORY,
-  ALLOWANCE_THRESHOLD_USDC,
   MIN_SIZE_SHARES,
   MIN_NOTIONAL_USDC,
   MIN_SPREAD_MULTIPLIER,
@@ -185,6 +182,10 @@ export class MarketMaker {
       this.clob.getAddress() // Signing key = EOA
     );
     
+    // CRITIQUE : Configurer les markets AVANT de connecter
+    // Le UserFeed enverra ces condition IDs dans le message d'auth
+    this.userFeed.setMarkets([market.conditionId]);
+    
     // Connecter au WebSocket utilisateur
     this.userFeed.connect();
     
@@ -221,20 +222,31 @@ export class MarketMaker {
     log.info({ 
       yesShares: this.inventory.getInventory(market.yesTokenId),
       noShares: this.inventory.getInventory(market.noTokenId)
-    }, "✅ Inventory synchronized for this market");
+    }, "✅ Inventory synced");
 
-    // CRITIQUE : Récupérer les ordres déjà ouverts avant de commencer
-    // Cela permet de reprendre là où on en était si le bot redémarre
-    log.info("📋 Checking for existing open orders...");
+    // NOUVEAU : Récupérer tick_size et min_order_size depuis CLOB pour chaque token
+    const tickYes = await this.clob.getTickSizeForToken(market.yesTokenId);
+    const tickNo = await this.clob.getTickSizeForToken(market.noTokenId);
+    const minSizeYes = await this.clob.getMinOrderSizeForToken(market.yesTokenId);
+    const minSizeNo = await this.clob.getMinOrderSizeForToken(market.noTokenId);
+    
+    // Initialiser le cache du feed
+    this.feed.setTickSize(market.yesTokenId, tickYes);
+    this.feed.setTickSize(market.noTokenId, tickNo);
+    this.feed.setMinOrderSize(market.yesTokenId, minSizeYes);
+    this.feed.setMinOrderSize(market.noTokenId, minSizeNo);
+    
+    log.info({
+      yesToken: { tick: tickYes, minSize: minSizeYes },
+      noToken: { tick: tickNo, minSize: minSizeNo }
+    }, "📐 Market constraints loaded");
+
     await this.loadExistingOrders();
 
-    // S'abonner aux mises à jour de prix temps réel via WebSocket
-    log.info("🔌 Subscribing to real-time price updates via WebSocket...");
-    this.feed.subscribe([market.yesTokenId, market.noTokenId], (tokenId, bestBid, bestAsk) => {
-      this.handlePriceUpdate(tokenId, bestBid, bestAsk);
+    this.feed.subscribe([market.yesTokenId, market.noTokenId], (tokenId, bestBid, bestAsk, tickSize) => {
+      this.handlePriceUpdate(tokenId, bestBid, bestAsk, tickSize);
     });
 
-    // Démarrer la logique de market making
     await this.initializeMarketMaking();
   }
 
@@ -621,8 +633,13 @@ export class MarketMaker {
         );
         
         if (canBuy) {
-          const buySize = this.calculateOrderSize(bestBid);
-          if (buySize && buySize >= 5) {
+          const buySize = await this.calculateOrderSize(tokenId, bestBid);
+          
+          // Vérifier dynamiquement le minOrderSize
+          let minSize = this.feed.getMinOrderSize(tokenId);
+          if (!minSize) minSize = 5; // Fallback
+          
+          if (buySize && buySize >= minSize) {
             log.info({
               tokenId: tokenId.substring(0, 20) + '...',
               side: "BUY",
@@ -916,7 +933,7 @@ export class MarketMaker {
     await this.placeOrders(tokenId, snapshot, tokenSide, otherSnapshot);
   }
 
-  private async handlePriceUpdate(tokenId: string, bestBid: number | null, bestAsk: number | null, tokenSide?: 'YES' | 'NO') {
+  private async handlePriceUpdate(tokenId: string, bestBid: number | null, bestAsk: number | null, tickSize: number) {
     if (!bestBid || !bestAsk || !this.marketInfo) return;
 
     // FILTRE CRITIQUE: Ignorer les données WebSocket corrompues
@@ -924,53 +941,19 @@ export class MarketMaker {
                            (bestBid === 0.001 && bestAsk === null) || 
                            (bestBid === null && bestAsk === 0.999);
     
-    if (isCorruptedData) {
-      log.debug({ 
-        tokenId: tokenId.substring(0, 20) + '...',
-        bestBid, 
-        bestAsk, 
-        reason: "Corrupted WebSocket data" 
-      }, "Ignoring corrupted price update");
-      return;
-    }
+    if (isCorruptedData) return; // Ignorer silencieusement
 
     const currentOrders = this.activeOrders.get(tokenId);
     const determinedSide = tokenId === this.marketInfo.yesTokenId ? 'YES' : 'NO';
-    
-    log.info({
-      tokenId: tokenId.substring(0, 20) + '...',
-      bestBid: bestBid.toFixed(4),
-      bestAsk: bestAsk.toFixed(4),
-      spread: (bestAsk - bestBid).toFixed(4),
-      determinedSide
-    }, "💰 Price update received");
-    
-    log.info({
-      tokenId: tokenId.substring(0, 20) + '...',
-      hasOrders: !!currentOrders,
-      bidId: currentOrders?.bidId || 'none',
-      askId: currentOrders?.askId || 'none',
-      bidPrice: currentOrders?.bidPrice || 'none',
-      askPrice: currentOrders?.askPrice || 'none',
-      lastPlaceTime: currentOrders?.lastPlaceTime || 'none'
-    }, "🔍 Checking active orders");
     
     // Vérifier si on a besoin de placer des ordres (manque bidId OU askId)
     const needsBid = !currentOrders?.bidId;
     const needsAsk = !currentOrders?.askId;
     
     if (needsBid || needsAsk) {
-      // Placer les ordres manquants avec les VRAIS prix WebSocket
-      log.info({
-        tokenId: tokenId.substring(0, 20) + '...',
-        needsBid,
-        needsAsk,
-        reason: needsBid && needsAsk ? 'No active orders' : needsBid ? 'Missing BUY order' : 'Missing SELL order'
-      }, "🎯 Placing missing orders");
-      
-      const prices = await this.calculateOrderPrices({ bestBid, bestAsk, tickSize: 0.001 }, determinedSide, tokenId);
+      const prices = await this.calculateOrderPrices({ bestBid, bestAsk, tickSize }, determinedSide, tokenId);
       if (prices) {
-        await this.placeOrders(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide, undefined, {
+        await this.placeOrders(tokenId, { bestBid, bestAsk, tickSize }, determinedSide, undefined, {
           placeBuy: needsBid,
           placeSell: needsAsk
         });
@@ -985,15 +968,7 @@ export class MarketMaker {
     const shouldReplace = this.shouldReplaceOrders(currentOrders, bestBid, bestAsk, targetSpread);
 
     if (shouldReplace && this.canReplaceOrders()) {
-      log.info({
-        tokenId: tokenId.substring(0, 20) + '...',
-        currentSpread: spread.toFixed(3),
-        targetSpread: targetSpread.toFixed(3),
-        currentMid: ((bestBid + bestAsk) / 2).toFixed(4),
-        lastMid: currentOrders.lastMid?.toFixed(4) || 'N/A'
-      }, "🔄 Replacing orders due to price change or competition");
-      
-      await this.replaceOrders(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide);
+      await this.replaceOrders(tokenId, { bestBid, bestAsk, tickSize }, determinedSide);
     }
   }
 
@@ -1012,47 +987,15 @@ export class MarketMaker {
     const orderAge = Date.now() - (currentOrders.lastPlaceTime || 0);
     const orderTooOld = orderAge > ORDER_TTL_MS;
     
-    log.info({
-      ourBid: currentOrders.bidPrice?.toFixed(4) || 'none',
-      marketBid: bestBid.toFixed(4),
-      ourAsk: currentOrders.askPrice?.toFixed(4) || 'none',
-      marketAsk: bestAsk.toFixed(4),
-      ourBidIsBest,
-      ourAskIsBest,
-      notInside,
-      currentMid: currentMid.toFixed(4),
-      lastMid: lastMid.toFixed(4),
-      priceMovement,
-      threshold: PRICE_CHANGE_THRESHOLD,
-      orderAge: (orderAge / 1000).toFixed(1) + 's',
-      orderTooOld,
-      ttl: (ORDER_TTL_MS / 1000).toFixed(1) + 's',
-      shouldReplace: notInside || priceMovement || orderTooOld
-    }, "🔍 Replace orders check");
-    
-    if (priceMovement) {
+    // Log seulement si on va replacer (réduire bruit)
+    if (notInside || priceMovement || orderTooOld) {
       log.info({
-        currentMid: currentMid.toFixed(4),
-        lastMid: lastMid.toFixed(4),
-        movement: Math.abs(currentMid - lastMid).toFixed(4),
-        threshold: PRICE_CHANGE_THRESHOLD
-      }, "⚡ Price movement detected, replacing orders");
-    }
-    
-    if (orderTooOld) {
-      log.info({
-        orderAge: (orderAge / 1000).toFixed(1) + 's',
-        ttl: (ORDER_TTL_MS / 1000).toFixed(1) + 's'
-      }, "⏰ Order TTL reached, replacing orders");
-    }
-    
-    if (notInside) {
-      log.info({
-        ourBid: currentOrders.bidPrice?.toFixed(4) || 'N/A',
-        marketBid: bestBid.toFixed(4),
-        ourAsk: currentOrders.askPrice?.toFixed(4) || 'N/A',
-        marketAsk: bestAsk.toFixed(4)
-      }, "🎯 Not inside market, replacing orders");
+        ourBid: currentOrders.bidPrice?.toFixed(4),
+        mktBid: bestBid.toFixed(4),
+        ourAsk: currentOrders.askPrice?.toFixed(4),
+        mktAsk: bestAsk.toFixed(4),
+        reason: notInside ? 'not_inside' : priceMovement ? 'price_moved' : 'ttl_expired'
+      }, "🔄 Replacing");
     }
     
     return notInside || priceMovement || orderTooOld;
@@ -1158,9 +1101,18 @@ export class MarketMaker {
         hasInventory: currentInventory > 0
       }, "📦 Current inventory status");
 
-      // Calculer les tailles séparément pour BUY et SELL
-      const buySize = this.calculateOrderSize(bidPrice);
-      const sellSize = currentInventory > 0 ? calculateSellSizeShares(currentInventory, askPrice, MAX_SELL_PER_ORDER_SHARES, 5, MIN_NOTIONAL_SELL_USDC) : null;
+      // Calculer les tailles séparément pour BUY et SELL avec minOrderSize dynamique
+      const buySize = await this.calculateOrderSize(tokenId, bidPrice);
+      
+      // Pour SELL, récupérer aussi le minOrderSize dynamique
+      let minSellShares = this.feed.getMinOrderSize(tokenId);
+      if (!minSellShares) {
+        minSellShares = await this.clob.getMinOrderSizeForToken(tokenId);
+        if (minSellShares) this.feed.setMinOrderSize(tokenId, minSellShares);
+        else minSellShares = 5; // Fallback
+      }
+      
+      const sellSize = currentInventory > 0 ? calculateSellSizeShares(currentInventory, askPrice, MAX_SELL_PER_ORDER_SHARES, minSellShares, MIN_NOTIONAL_SELL_USDC) : null;
 
       log.info({
         slug: this.marketInfo.slug,
@@ -1533,6 +1485,38 @@ export class MarketMaker {
 
     const midPrice = (bestBid + bestAsk) / 2;
     const rawSpread = bestAsk - bestBid;
+    
+    // GARDE-FOU CRITIQUE : Spread minimum (annulation immédiate si breach)
+    const minSpreadRequired = this.config.targetSpreadCents / 100 * 0.6; // 60% du target minimum
+    if (rawSpread < minSpreadRequired) {
+      log.warn({
+        tokenId: tokenId.substring(0, 20) + '...',
+        rawSpread: (rawSpread * 100).toFixed(1) + '¢',
+        minRequired: (minSpreadRequired * 100).toFixed(1) + '¢',
+        action: 'cancelling_orders'
+      }, "⚠️ Spread breach - cancelling orders immediately");
+      
+      // Annulation immédiate (ne pas attendre TTL)
+      await this.orderCloser.closeOrdersForToken(tokenId);
+      const currentOrders = this.activeOrders.get(tokenId);
+      if (currentOrders) {
+        currentOrders.bidId = undefined;
+        currentOrders.askId = undefined;
+      }
+      
+      return null;
+    }
+    
+    // PIN-RISK GUARD : Marchés extrêmes (p ≈ 0 ou 1)
+    if (midPrice > 0.98 || midPrice < 0.02) {
+      log.warn({
+        tokenId: tokenId.substring(0, 20) + '...',
+        mid: midPrice.toFixed(4),
+        reason: midPrice > 0.98 ? 'price_near_1' : 'price_near_0',
+        action: 'skip_quoting'
+      }, "🚨 Pin-risk detected");
+      return null;
+    }
     const baseTargetSpread = this.config.targetSpreadCents / 100;
     
     // Récupérer le dernier prix tradé réel (via CLOB ou mid-price)
@@ -1754,7 +1738,7 @@ export class MarketMaker {
    * Calcule la taille d'un ordre BUY en adaptant le notional au capital disponible si AUTO_ADJUST_NOTIONAL est activé.
    * Cette méthode utilise la logique unifiée de risk/sizing et respecte les contraintes de notional minimum.
    */
-  private calculateOrderSize(price: number): number | null {
+  private async calculateOrderSize(tokenId: string, price: number): Promise<number | null> {
     // Calcule le notional en fonction du solde USDC actuel si AUTO_ADJUST_NOTIONAL est activé
     let notional = this.config.notionalPerOrderUsdc;
     
@@ -1797,10 +1781,18 @@ export class MarketMaker {
       return null;
     }
     
-    // CRITIQUE: Polymarket exige un minimum de 5 shares pour tous les ordres
-    // Pour les prix élevés, il faut augmenter le notional pour atteindre ce minimum
-    const minShares = 5; // Minimum Polymarket
-    const requiredNotional = price * minShares; // Notional requis pour atteindre 5 shares
+    // CRITIQUE: Récupérer le minOrderSize dynamique du CLOB (par marché)
+    let minShares = this.feed.getMinOrderSize(tokenId);
+    if (!minShares || minShares === 0) {
+      // Fallback : interroger le CLOB directement
+      minShares = await this.clob.getMinOrderSizeForToken(tokenId);
+      if (minShares) {
+        this.feed.setMinOrderSize(tokenId, minShares);
+      } else {
+        minShares = 5; // Fallback final si CLOB ne répond pas
+      }
+    }
+    const requiredNotional = price * minShares; // Notional requis pour atteindre minShares
     
     // Si le notional actuel ne permet pas d'atteindre 5 shares, l'augmenter
     if (notional < requiredNotional) {
