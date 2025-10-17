@@ -10,16 +10,16 @@ RUN apk add --no-cache git
 # Copy package files first (pour le cache Docker)
 COPY package*.json ./
 
-# Install dependencies sans cache npm
-RUN npm ci --only=production --no-audit --no-fund --prefer-offline
+# Install ALL dependencies (including devDependencies for build)
+RUN npm ci --no-audit --no-fund
 
-# Copy source code
+# Copy source code and config files
 COPY . .
 
 # Build TypeScript
 RUN npm run build
 
-# Clean up dev dependencies pour réduire la taille
+# Clean up dev dependencies après le build
 RUN npm prune --production
 
 # Expose port
