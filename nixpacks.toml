@@ -2,7 +2,7 @@
 nixPkgs = ["nodejs_18", "npm-9_x"]
 
 [phases.install]
-cmds = ["npm cache clean --force", "npm ci"]
+cmds = ["npm ci"]
 
 [phases.build]
 cmds = ["npm run build"]
