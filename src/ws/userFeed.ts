@@ -1,7 +1,7 @@
 // src/ws/userFeed.ts - WebSocket utilisateur pour recevoir les fills en temps réel
 import WebSocket from "ws";
 import crypto from "crypto";
-import { rootLog } from "../index";
+import { rootLog } from "../logger";
 import { WSS_USER_URL } from "../config";
 
 const log = rootLog.child({ name: "ws-user" });
@@ -107,14 +107,32 @@ export class UserFeed {
       this.isConnecting = false;
       this.reconnectAttempts = 0;
       
+      // Envoyer 1 frame d'auth/subscribe
+      this.ws!.send(JSON.stringify({
+        type: "user",
+        markets: [], // tous mes évènements utilisateur
+        auth: { 
+          apikey: this.apiKey, 
+          secret: this.apiSecret, 
+          passphrase: this.passphrase 
+        }
+      }));
+      
       log.info("✅ User WebSocket connected - ready to receive fills, orders, balance updates");
       
-      // Ping périodique
+      // Keepalive propre (évite messages texte)
+      let lastPong = Date.now();
+      this.ws!.on("pong", () => { lastPong = Date.now(); });
+      
       this.ping = setInterval(() => {
+        if (Date.now() - lastPong > 30000) { 
+          this.ws!.terminate(); 
+          return; 
+        }
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.ws.ping();
         }
-      }, 25_000); // Augmenté à 25s comme suggéré
+      }, 10000);
     });
 
     this.ws.on("pong", () => {
@@ -123,73 +141,145 @@ export class UserFeed {
 
     this.ws.on("message", (buf) => {
       try {
-        const data = buf.toString();
+        const txt = buf.toString();
         
-        if (data === "PONG") {
-          return;
+        // Même filtre PING/PONG qu'au-dessus
+        if (txt === "PING" || txt === "PONG") return;
+        
+        let msg: any;
+        try { 
+          msg = JSON.parse(txt); 
+        } catch (parseError) {
+          log.debug({ parseError, data: txt.substring(0, 200) }, "Failed to parse user WS message");
+          return; 
         }
         
-        const msg = JSON.parse(data);
+        // Log du message parsé pour debug
+        log.debug({ event_type: msg.event_type, type: msg.type }, "User WS message received");
         
-        // Log tous les messages pour debug
-        log.debug({
-          event_type: msg.event_type,
-          type: msg.type,
-          message: JSON.stringify(msg)
-        }, "🔍 UserFeed message received");
-        
-        // Fill event (ordre exécuté totalement ou partiellement)
-        if (msg.event_type === "match" || msg.type === "fill" || msg.event_type === "fill") {
-          const fill: FillEvent = {
-            type: "fill",
-            orderId: msg.order_id || msg.orderId,
-            asset: msg.asset_id || msg.asset,
-            market: msg.market,
-            side: msg.side?.toUpperCase() as "BUY" | "SELL",
-            price: msg.price,
-            size: msg.size || msg.size_matched,
-            fee: msg.fee_rate_bps ? (parseFloat(msg.price) * parseFloat(msg.size) * parseFloat(msg.fee_rate_bps) / 10000).toString() : "0",
-            timestamp: msg.timestamp || Date.now(),
-            status: "MATCHED"
-          };
-          
-          log.info({
-            orderId: fill.orderId.substring(0, 16) + '...',
-            side: fill.side,
-            price: fill.price,
-            size: fill.size,
-            asset: fill.asset.substring(0, 20) + '...'
-          }, "💰 FILL EVENT");
-          
-          this.fillListeners.forEach(listener => listener(fill));
+        // Route messages
+        if (msg.event_type === "trade" || msg.event_type === "fill") {
+          try {
+            // Les événements "trade" avec orderId UUID (ex: d62084ef-...) sont des trades d'AUTRES utilisateurs
+            // NOS ordres ont des IDs hex (0x...)
+            // On peut les ignorer car on recevra un événement "order" MATCHED pour nos fills
+            const orderId = msg.order_id || msg.orderId || msg.id || "";
+            
+            if (orderId && !orderId.startsWith("0x")) {
+              log.debug({ orderId: orderId.substring(0, 16) + '...' }, "Ignoring trade event from other user (UUID orderId)");
+              return;
+            }
+            
+            const fill = {
+              asset_id: msg.asset_id ?? msg.trade?.asset_id,
+              side: (msg.side ?? msg.trade?.side)?.toLowerCase(), // "buy"/"sell"
+              size: Number(msg.size ?? msg.trade?.size),
+              price: Number(msg.price ?? msg.trade?.price),
+              ts: Date.now(),
+              market_slug: msg.market_slug, // si fourni
+            };
+            
+            // Validation des champs requis
+            if (!fill.asset_id || !fill.side || isNaN(fill.size) || isNaN(fill.price)) {
+              log.warn({ msg }, "Fill event missing required fields");
+              return;
+            }
+            
+            // Convertir en format FillEvent existant
+            const fillEvent: FillEvent = {
+              type: "fill",
+              orderId: orderId,
+              asset: fill.asset_id,
+              market: fill.market_slug || "unknown",
+              side: fill.side?.toUpperCase() as "BUY" | "SELL",
+              price: fill.price.toString(),
+              size: fill.size.toString(),
+              fee: "0",
+              timestamp: fill.ts,
+              status: "MATCHED"
+            };
+            
+            log.info({
+              orderId: fillEvent.orderId?.substring(0, 16) + '...' || 'unknown',
+              side: fillEvent.side,
+              price: fillEvent.price,
+              size: fillEvent.size,
+              asset: fillEvent.asset?.substring(0, 20) + '...' || 'unknown'
+            }, "💰 FILL EVENT from trade");
+            
+            this.fillListeners.forEach(listener => listener(fillEvent));
+          } catch (fillError) {
+            log.error({ fillError, msg }, "Error processing fill event");
+          }
         }
         
         // Order status update (LIVE, CANCELLED, etc.)
         else if (msg.event_type === "order" || msg.type === "order") {
-          const order: OrderEvent = {
-            type: "order",
-            orderId: msg.order_id || msg.orderId,
-            status: msg.status?.toUpperCase() || "LIVE",
-            asset: msg.asset_id || msg.asset,
-            side: msg.side?.toUpperCase() as "BUY" | "SELL",
-            price: msg.price,
-            originalSize: msg.original_size || msg.size,
-            sizeMatched: msg.size_matched,
-            timestamp: msg.timestamp || Date.now()
-          };
-          
-          log.info({
-            orderId: order.orderId.substring(0, 16) + '...',
-            status: order.status,
-            side: order.side,
-            price: order.price,
-            size: order.originalSize
-          }, `📋 ORDER ${order.status}`);
-          
-          this.orderListeners.forEach(listener => listener(order));
+          try {
+            // Validation des champs requis
+            if (!msg.asset_id && !msg.asset) {
+              log.warn({ msg }, "Order event missing asset");
+              return;
+            }
+            
+            const order: OrderEvent = {
+              type: "order",
+              orderId: msg.order_id || msg.orderId || msg.id || "unknown",
+              status: msg.status?.toUpperCase() || "LIVE",
+              asset: msg.asset_id || msg.asset,
+              side: msg.side?.toUpperCase() as "BUY" | "SELL",
+              price: msg.price,
+              originalSize: msg.original_size || msg.size,
+              sizeMatched: msg.size_matched,
+              timestamp: msg.timestamp || Date.now()
+            };
+            
+            log.info({
+              orderId: order.orderId?.substring(0, 16) + '...' || 'unknown',
+              status: order.status,
+              side: order.side,
+              price: order.price,
+              size: order.originalSize
+            }, `📋 ORDER ${order.status}`);
+            
+            this.orderListeners.forEach(listener => listener(order));
+            
+            // Si l'ordre est MATCHED, c'est un FILL !
+            // Convertir en FillEvent et notifier les fill listeners aussi
+            if (order.status === "MATCHED") {
+              const fillEvent: FillEvent = {
+                type: "fill",
+                orderId: order.orderId,
+                asset: order.asset,
+                market: "unknown",
+                side: order.side,
+                price: order.price,
+                size: order.originalSize,
+                fee: "0",
+                timestamp: order.timestamp,
+                status: "MATCHED"
+              };
+              
+              log.info({
+                orderId: fillEvent.orderId?.substring(0, 16) + '...' || 'unknown',
+                side: fillEvent.side,
+                price: fillEvent.price,
+                size: fillEvent.size
+              }, "💰 FILL from ORDER MATCHED event");
+              
+              this.fillListeners.forEach(listener => listener(fillEvent));
+            }
+          } catch (orderError) {
+            log.error({ orderError, msg }, "Error processing order event");
+          }
+        }
+        
+        // Log des messages non reconnus pour debug
+        else {
+          log.debug({ msg }, "Unrecognized user WS message type");
         }
       } catch (e) {
-        log.warn({ e, data: buf.toString().substring(0, 100) }, "WS user parse error");
+        log.warn({ e, data: buf.toString().substring(0, 200) }, "WS user parse error");
       }
     });
 

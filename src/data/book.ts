@@ -25,6 +25,15 @@ export async function snapshotTop(tokenId: string): Promise<Top> {
   const tick = book?.tick_size ? Number(book.tick_size) : null;
   const neg = book?.neg_risk ? Boolean(book.neg_risk) : null;
   
+  // CORRECTIF: Log explicite pour confirmer l'utilisation du fallback REST
+  if (bestBid && bestAsk && bestBid > 0.001 && bestAsk < 0.999) {
+    log.info({ 
+      tokenId: tokenId.substring(0, 20) + '...', 
+      bestBid, 
+      bestAsk 
+    }, "✅ top-of-book via REST");
+  }
+  
   return { bestBid, bestAsk, tickSize: tick, negRisk: neg };
 }
 

@@ -1,6 +1,7 @@
 // Wrapper autour du SDK officiel Polymarket pour compatibilité totale
 import { ClobClient, Side } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
+import axios from "axios";
 import pino from "pino";
 
 const log = pino({ name: "poly-sdk" });
@@ -259,6 +260,54 @@ export class PolyClobClient {
       return side as 0 | 1;
     }
     return side === "BUY" ? 0 : 1;
+  }
+
+  /**
+   * Récupère les meilleurs bid/ask via POST /prices (batch)
+   * Source de vérité en fallback du WebSocket
+   */
+  async getBestBidAsk(tokenId: string): Promise<{ bid: number | null; ask: number | null }> {
+    try {
+      const body = {
+        params: [
+          { token_id: tokenId, side: "BUY" },
+          { token_id: tokenId, side: "SELL" }
+        ]
+      };
+      
+      const resp = await axios.post("https://clob.polymarket.com/prices", body);
+      
+      // La réponse est un tableau aligné sur params
+      const buyPrice = resp.data?.[0]?.price ? Number(resp.data[0].price) : null;
+      const sellPrice = resp.data?.[1]?.price ? Number(resp.data[1].price) : null;
+      
+      return { bid: buyPrice, ask: sellPrice };
+    } catch (error) {
+      log.debug({ tokenId, error: (error as Error).message }, "Failed to get best bid/ask");
+      return { bid: null, ask: null };
+    }
+  }
+
+  /**
+   * Récupère les spreads via POST /spreads (batch)
+   * Permet de valider rapidement si un marché est éligible
+   */
+  async getSpreads(tokenIds: string[]): Promise<Record<string, number>> {
+    try {
+      const body = tokenIds.map(t => ({ token_id: t }));
+      const resp = await axios.post("https://clob.polymarket.com/spreads", body);
+      
+      // Réponse : { [tokenId]: "0.05", ... }
+      const out: Record<string, number> = {};
+      for (const [k, v] of Object.entries(resp.data || {})) {
+        out[k] = v == null ? NaN : Number(v as string);
+      }
+      
+      return out;
+    } catch (error) {
+      log.debug({ error: (error as Error).message }, "Failed to get spreads");
+      return {};
+    }
   }
 }
 

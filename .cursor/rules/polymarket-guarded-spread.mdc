@@ -1,0 +1,231 @@
+---
+alwaysApply: true
+---
+
+# PolymMM-GuardedSpread - Règle d'implémentation
+
+## 📋 Vue d'ensemble
+
+Ce projet implémente un bot de market-making pour Polymarket suivant le flux **PolymMM-GuardedSpread v2**.
+
+**Principe** : Trading séquentiel strict avec filtrage rigoureux, gestion des risques avancée, et retrait immédiat si critères non respectés.
+
+## 🎯 Architecture obligatoire
+
+```
+src/
+├── clients/          # Communication Polymarket
+│   ├── polySDK.ts    # SDK officiel wrapper
+│   └── gamma.ts      # API Gamma (marchés)
+├── ws/               # WebSocket temps réel
+│   ├── marketFeed.ts # Prix (best bid/ask)
+│   └── userFeed.ts   # Fills & order updates
+├── lib/              # Utilitaires
+│   └── amounts.ts    # Quantisation montants
+├── data/             # Données marché
+│   └── book.ts       # Orderbook
+├── core/             # Modules principaux
+│   ├── MarketSelector.ts  # Filtrage strict
+│   ├── StateMachine.ts    # Machine à états
+│   ├── RiskManager.ts     # Caps & exposition
+│   ├── OrderManager.ts    # Gestion ordres
+│   └── MarketMaker.ts     # Orchestrateur
+├── config.ts         # Configuration
+└── index.ts          # Point d'entrée
+```
+
+## ⚙️ Variables de configuration (.env)
+
+### Credentials (requis)
+- PRIVATE_KEY
+- CLOB_API_KEY
+- CLOB_API_SECRET
+- CLOB_PASSPHRASE
+- POLY_PROXY_ADDRESS
+
+### Sélection des marchés
+- MAX_MARKETS = 3
+- MIN_SPREAD_CENTS = 1.5
+- MIN_VOLUME_24H_USD = 5000
+- MIN_DEPTH_TOP2_USD = 300
+- HOURS_TO_CLOSE_MIN = 24
+- MAX_MARKETS_PER_EVENT = 1
+
+### Sizing & profitabilité
+- MIN_NOTIONAL_PER_ORDER_USDC = 2.0
+- MIN_EXPECTED_PROFIT_USDC = 0.02
+
+### Caps de risque
+- MAX_SHARES_PER_MARKET = 50
+- MAX_USDC_PER_MARKET = 8
+- MAX_NOTIONAL_AT_RISK_USDC = 25
+
+### Gestion des ordres
+- ORDER_TTL_MS = 10000
+- REPLACE_PRICE_TICKS = 1
+- ASK_CHASE_WINDOW_SEC = 8
+- ASK_CHASE_MAX_REPLACES = 3
+
+## 🔄 Flux séquentiel (Machine à états)
+
+### États obligatoires
+
+IDLE → PLACE_BUY → WAIT_BUY_FILL → PLACE_SELL → ASK_CHASE → WAIT_SELL_FILL → COMPLETE → IDLE
+  ↳ DEACTIVATING (si critères non respectés)
+
+### Détail des états
+
+**IDLE** : Marché prêt pour nouveau cycle
+- Vérifier critères éligibilité
+- Transition vers PLACE_BUY si OK
+
+**PLACE_BUY** : Placer ordre BUY
+- Prix = best bid (arrondi tick)
+- Taille = selon caps + min notional + expected profit
+- Post-only : si croise → +1 tick
+- Type = GTC
+
+**WAIT_BUY_FILL** : Attendre fill BUY
+- Replace si best bid change ≥ REPLACE_PRICE_TICKS
+- Replace si TTL expiré
+- Sur fill → PLACE_SELL
+
+**PLACE_SELL** : Placer ordre SELL
+- Prix = best ask (arrondi tick)
+- Taille = quantité achetée (miroir)
+- Type = GTC
+- Place même si spread tombé
+
+**ASK_CHASE** : Chase le ask
+- Fenêtre = ASK_CHASE_WINDOW_SEC (8s)
+- Max replaces = ASK_CHASE_MAX_REPLACES (3)
+- Replace si best ask change
+- Ne jamais croiser bid
+
+**WAIT_SELL_FILL** : Attendre fill SELL
+- Sur fill → COMPLETE
+
+**COMPLETE** : Cycle terminé
+- Retour à IDLE
+
+**DEACTIVATING** : Retrait marché
+- Si position > 0 : SELL + ask_chase jusqu'à flat
+- Si flat : annuler ordres + unsubscribe WS
+- Remplacer par meilleur candidat
+
+## 🔒 Filtrage strict (MarketSelector)
+
+Un marché est éligible SI ET SEULEMENT SI :
+
+1. spread ≥ MIN_SPREAD_CENTS
+2. volume_24h ≥ MIN_VOLUME_24H_USD
+3. depth_top2 ≥ MIN_DEPTH_TOP2_USD
+4. hours_to_close ≥ HOURS_TO_CLOSE_MIN
+5. Supporte MIN_NOTIONAL_PER_ORDER_USDC
+6. expected_profit = (spread/100) * notional ≥ MIN_EXPECTED_PROFIT_USDC
+
+Score classement = spread*0.4 + depth*0.3 + volume*0.2 + time*0.1
+
+Sélectionner TOP 3 avec MAX_MARKETS_PER_EVENT = 1
+
+## 🛡️ Gouvernance des ordres
+
+### Side-lock STRICT
+- UN SEUL ordre actif par marché (BUY OU SELL)
+- Pas de YES & NO simultanés
+
+### Caps contraignants (RiskManager)
+
+Refuser ordre si :
+- position_shares_by_market > MAX_SHARES_PER_MARKET
+- notional_exposure_by_market > MAX_USDC_PER_MARKET
+- notional_exposure_global > MAX_NOTIONAL_AT_RISK_USDC
+- taille_en_USDC < MIN_NOTIONAL_PER_ORDER_USDC
+- expected_profit < MIN_EXPECTED_PROFIT_USDC
+
+## 🔄 Retrait immédiat
+
+Si marché actif ne respecte plus UN SEUL filtre :
+1. Arrêter nouveaux BUY
+2. Liquider position : SELL au best ask + ask_chase
+3. Annuler ordres restants
+4. Unsubscribe WebSocket
+5. Remplacer par meilleur candidat
+
+## 📊 Ingestion des données
+
+### REST API (30-60s)
+- GET /markets → token_id, end_date
+- POST /prices → best bid/ask
+- GET /spreads → spread
+- GET /book → depth_top2
+
+### WebSocket temps réel
+- Market feed : best_bid/best_ask change
+- User feed : ack, fill, cancel
+
+### Réconciliation (30-60s)
+- GET /orders → ordres ouverts
+- Data API → holdings/trades
+
+## 🔄 Remplacements & réactivité
+
+Replace BUY/SELL si :
+- Best bid/ask bouge ≥ REPLACE_PRICE_TICKS
+- TTL expiré (ORDER_TTL_MS)
+- Tick size change (WS)
+
+Contrainte : UN SEUL ordre actif par marché
+
+## 📈 Monitoring & invariants
+
+### Invariants continus
+- open_orders_by_market ≤ 1
+- position_by_market ≤ MAX_SHARES_PER_MARKET
+- notional_global ≤ MAX_NOTIONAL_AT_RISK_USDC
+- Respect side-lock & caps
+
+### Logs détaillés (skip_reasons)
+- spread_too_small
+- volume_low
+- depth_low
+- closing_soon
+- min_notional
+- expected_profit_low
+- risk_cap_hit
+- would_cross
+
+### WebSocket santé
+- Ping/pong automatique
+- Resubscribe automatique
+- Détection inactifs (>5min)
+
+## 🚫 INTERDIT
+
+- Placer YES et NO simultanément sur même marché
+- Plusieurs ordres actifs sur même marché
+- Dépasser les caps (shares, notional, global)
+- Ordres < MIN_NOTIONAL_PER_ORDER_USDC
+- Expected profit < MIN_EXPECTED_PROFIT_USDC
+- Trader marchés ne respectant pas filtres
+- Code mort ou fichiers inutilisés
+
+## ✅ Principes de développement
+
+1. Simplicité : Architecture claire, modules séparés
+2. Sécurité : Caps stricts, invariants vérifiés
+3. Robustesse : Retry, backoff, reconciliation
+4. Monitoring : Logs détaillés, métriques
+5. Performance : WebSocket temps réel
+6. Clean code : Pas de code mort
+
+## 🎯 Objectif
+
+Bot market-making rentable, sécurisé et robuste qui :
+- Capture le spread sur marchés liquides
+- Gère les risques strictement
+- Se retire si conditions défavorables
+- Monitore en continu
+- Ne plante jamais
+
+Version : PolymMM-GuardedSpread v2

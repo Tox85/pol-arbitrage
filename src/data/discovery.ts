@@ -1,8 +1,6 @@
-// src/data/discovery.ts
+// src/data/discovery.ts - Découverte simplifiée des marchés
 import pino from "pino";
 import { fetchAllOpenTradableMarkets } from "../clients/gamma";
-// GammaMarket type - UNUSED (removed, type inferred)
-// Plus besoin de CustomClobClient - on utilise uniquement l'API Gamma
 
 const log = pino({ name: "discovery" });
 
@@ -18,9 +16,17 @@ type Picked = {
   volume24hrClob?: number|null;
 };
 
+/**
+ * Découvre les marchés actifs sur le CLOB Polymarket
+ * APPROCHE: Utiliser uniquement l'API Gamma (plus fiable que le CLOB direct)
+ * 
+ * @param max Nombre maximum de marchés à retourner
+ * @param minVol Volume minimum en USD pour filtrer
+ * @returns Liste de marchés avec leurs token IDs normalisés
+ */
 export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[]> {
-  // NOUVELLE APPROCHE: Utiliser uniquement Gamma puisque CLOB ne donne pas de résultats
-  const gamma = await fetchAllOpenTradableMarkets();
+  // Récupérer tous les marchés depuis Gamma
+  const gamma = await fetchAllOpenTradableMarkets(5); // 5 pages max = 1000 marchés
   
   log.info({ gamma: gamma.length }, "Marchés Gamma trouvés");
   
@@ -37,6 +43,7 @@ export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[
       tokenIds = gm.clobTokenIds;
     } else if (typeof gm.clobTokenIds === 'string') {
       try {
+        // Essayer de parser si c'est une chaîne JSON
         tokenIds = JSON.parse(gm.clobTokenIds);
       } catch (e) {
         log.warn({ marketId: gm.id, clobTokenIds: gm.clobTokenIds }, "Token IDs mal formatés");
@@ -76,3 +83,4 @@ export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[
   log.info({ gamma: gamma.length, selected: out.length }, "marchés Gamma sélectionnés");
   return out.slice(0, max);
 }
+
