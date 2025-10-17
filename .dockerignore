@@ -13,4 +13,7 @@ coverage
 *.log
 .npm
 .npm-cache
-node_modules/.cache
+dist
+logs
+scripts
+tsconfig.json
