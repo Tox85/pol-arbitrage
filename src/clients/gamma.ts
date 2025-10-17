@@ -5,6 +5,29 @@ import pino from "pino";
 const log = pino({ name: "gamma" });
 const BASE = process.env.GAMMA_API_URL || "https://gamma-api.polymarket.com";
 
+// Utilitaire pour normaliser les clobTokenIds
+function normalizeClobTokenIds(raw: unknown): { yes: string; no: string } | null {
+  if (Array.isArray(raw) && raw.length === 2 && raw.every(x => typeof x === 'string')) {
+    return { yes: raw[0].trim(), no: raw[1].trim() };
+  }
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (s.startsWith('[') && s.endsWith(']')) {
+      try {
+        const arr = JSON.parse(s);
+        if (Array.isArray(arr) && arr.length === 2 && arr.every(x => typeof x === 'string')) {
+          return { yes: arr[0].trim(), no: arr[1].trim() };
+        }
+      } catch {}
+    }
+    if (s.includes(',')) {
+      const [a, b] = s.split(',').map(t => t.trim().replace(/^"|"$/g, ''));
+      if (a && b) return { yes: a, no: b };
+    }
+  }
+  return null;
+}
+
 export type GammaMarket = {
   id: string;
   slug: string | null;
@@ -37,12 +60,12 @@ export async function fetchOpenTradableMarkets(limit=200, offset=0): Promise<Gam
     
     try {
       const { data } = await axios.get<GammaMarket[]>(url, { timeout: 15000 });
-      const rows = Array.isArray(data) ? data : [];
+      const page: any[] = Array.isArray(data) ? data : [];
       
       // Extraire les marchés des événements et filtrer
       const allMarkets: GammaMarket[] = [];
       
-      for (const item of rows) {
+      for (const item of page) {
         if (item.markets && Array.isArray(item.markets)) {
           // C'est un événement avec des marchés imbriqués
           for (const market of item.markets) {
@@ -76,26 +99,14 @@ export async function fetchOpenTradableMarkets(limit=200, offset=0): Promise<Gam
         // Vérifier que l'orderbook est activé
         if (m.enableOrderBook !== true) return false;
         
-        // Vérifier qu'on a les token IDs
-        if (!m.clobTokenIds) return false;
-        
-        let tokenIds: string[] = [];
-        if (Array.isArray(m.clobTokenIds)) {
-          tokenIds = m.clobTokenIds;
-        } else if (typeof m.clobTokenIds === 'string') {
-          try {
-            tokenIds = JSON.parse(m.clobTokenIds);
-          } catch (e) {
-            return false;
-          }
-        }
-        
-        if (tokenIds.length < 2) return false;
+        // Vérifier qu'on a les token IDs normalisés
+        const ids = normalizeClobTokenIds(m.clobTokenIds);
+        if (!ids) return false;
         
         return true;
       });
       
-      log.info({ url, total: rows.length, tradable: filtered.length }, "gamma markets page");
+      log.info({ url, total: page.length, tradable: filtered.length }, "gamma markets page");
       
       // Si on trouve des marchés actifs, on les retourne
       if (filtered.length > 0) {
@@ -119,4 +130,55 @@ export async function fetchAllOpenTradableMarkets(maxPages=10): Promise<GammaMar
     if (page.length < 200) break;
   }
   return acc;
+}
+
+// Nouvelle fonction avec vraie pagination et normalisation
+export type CandidateMarket = {
+  slug: string;
+  yesAsset: string;
+  noAsset: string;
+  volume24h: number;
+};
+
+export async function listCandidateMarkets(minVolume: number = 0): Promise<CandidateMarket[]> {
+  let offset = 0;
+  const limit = 200;
+  const out: CandidateMarket[] = [];
+  
+  for (;;) {
+    const url = `${BASE}/events?closed=false&limit=${limit}&offset=${offset}`;
+    log.info({ url }, "Fetching Gamma markets");
+    
+    try {
+      const resp = await axios.get(url, { timeout: 15000 });
+      const page: any[] = Array.isArray(resp.data) ? resp.data : [];
+      
+      if (!page.length) break;
+      
+      for (const m of page) {
+        if (m.active !== true || m.acceptingOrders !== true || m.archived === true || m.closed === true) continue;
+        
+        const vol = Number(m.volume24hrClob ?? m.volume24hr ?? 0);
+        if (vol < minVolume) continue;
+        
+        const ids = normalizeClobTokenIds(m.clobTokenIds);
+        if (!ids) continue;
+        
+        out.push({ 
+          slug: m.slug, 
+          yesAsset: ids.yes, 
+          noAsset: ids.no, 
+          volume24h: vol 
+        });
+      }
+      
+      offset += page.length;
+      if (page.length < limit) break;
+    } catch (error) {
+      log.error({ url, error }, "Failed to fetch Gamma markets page");
+      break;
+    }
+  }
+  
+  return out;
 }

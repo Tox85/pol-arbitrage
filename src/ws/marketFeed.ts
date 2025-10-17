@@ -1,6 +1,6 @@
 // src/ws/marketFeed.ts
 import WebSocket from "ws";
-import { rootLog } from "../index";
+import { rootLog } from "../logger";
 import { WSS_URL } from "../config";
 
 const log = rootLog.child({ name: "ws" });
@@ -18,10 +18,16 @@ export class MarketFeed {
   private lastPriceLogs = new Map<string, {bid: number|null, ask: number|null}>();
   // Timestamp de la dernière mise à jour par token (pour détecter les marchés inactifs)
   private lastPriceUpdateTime = new Map<string, number>();
+  // Cache des tick_size par token (dynamique)
+  private tickSizes = new Map<string, number>();
   private currentTokenIds: string[] = [];
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private isConnecting = false;
+  
+  // State local pour abonnement unique
+  private subscribed = new Set<string>();
+  private subTimer: NodeJS.Timeout | null = null;
 
   subscribe(tokenIds: string[], onUpdate: (tokenId:string, bb:number|null, ba:number|null)=>void) {
     // Ne PAS écraser les listeners existants, juste ajouter/mettre à jour
@@ -33,13 +39,148 @@ export class MarketFeed {
       } else {
         log.debug({ tokenId: t.substring(0, 20) + '...' }, "Listener already exists, keeping it");
       }
+      // CORRECTIF: Ajouter chaque token à la liste de souscription
+      this.subscribeAsset(t);
     });
     this.currentTokenIds = tokenIds;
     this.connect(tokenIds);
   }
+
+  // Nouvelles méthodes pour abonnement unique
+  subscribeAsset(id: string) {
+    this.subscribed.add(id.trim());
+    if (this.subTimer) clearTimeout(this.subTimer);
+    this.subTimer = setTimeout(() => this.flushSubscription(), 75);
+  }
+
+  unsubscribeAsset(id: string) {
+    this.subscribed.delete(id.trim());
+    if (this.subTimer) clearTimeout(this.subTimer);
+    this.subTimer = setTimeout(() => this.flushSubscription(), 75);
+  }
+
+  private flushSubscription() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // CORRECTIF: Utiliser "MARKET" en majuscules comme dans la version fonctionnelle
+    this.ws.send(JSON.stringify({ type: "MARKET", assets_ids: Array.from(this.subscribed) }));
+    log.info({ count: this.subscribed.size }, "📡 Subscription envoyée (MARKET)");
+  }
+
+  // Parsing post-migration (schema 2025-09-15)
+  private handleMessage(msg: any) {
+    switch (msg.event_type) {
+      case "book":
+        // msg.bids / msg.asks — mets à jour le snapshot + top init
+        const asset = msg.asset_id;
+        const bb = msg.bids?.length ? Number(msg.bids[0].price) : null;
+        const ba = msg.asks?.length ? Number(msg.asks[0].price) : null;
+        
+        // Validation simple : bid < ask, bid > 0, ask <= 1
+        // Sur Polymarket, des marchés one-sided (ex: 0.002/0.003 ou 0.997/0.998) sont valides
+        if (bb !== null && ba !== null && bb < ba && bb > 0 && ba <= 1) {
+          this.lastPrices.set(asset, { bestBid: bb, bestAsk: ba });
+          this.lastPriceUpdateTime.set(asset, Date.now());
+          this.listeners.get(asset)?.(bb, ba);
+          log.debug({ 
+            asset: asset.substring(0, 20) + '...', 
+            bb: bb.toFixed(4), 
+            ba: ba.toFixed(4) 
+          }, "📚 book snapshot");
+        } else {
+          log.debug({
+            asset: asset.substring(0, 20) + '...',
+            bb, ba,
+            reason: "Invalid book data (bid >= ask or out of range)"
+          }, "⚠️ Ignoring invalid book data");
+        }
+        break;
+        
+      case "price_change":
+        for (const pc of msg.price_changes) {
+          // Utiliser best_bid/best_ask directement depuis price_change
+          const bid = pc.best_bid == null ? null : Number(pc.best_bid);
+          const ask = pc.best_ask == null ? null : Number(pc.best_ask);
+          
+          // Garde-fous : filtrer les valeurs aberrantes
+          // - 0 < bid < ask <= 1
+          // - spread <= 0.20 (20¢) pour éviter les carnets fantômes
+          const spread = bid !== null && ask !== null ? ask - bid : null;
+          const ok = bid !== null && ask !== null && bid > 0 && ask <= 1 && bid < ask && spread !== null && spread <= 0.20;
+          
+          if (!ok) {
+            log.debug({ 
+              asset: pc.asset_id.substring(0, 20) + '...', 
+              bid, 
+              ask, 
+              spread: spread ? (spread * 100).toFixed(1) + '¢' : 'N/A'
+            }, "⚠️ ignore price_change (implausible)");
+            continue;
+          }
+          
+          // Valeurs valides : mettre à jour
+          this.lastPrices.set(pc.asset_id, { bestBid: bid, bestAsk: ask });
+          this.lastPriceUpdateTime.set(pc.asset_id, Date.now());
+          this.listeners.get(pc.asset_id)?.(bid, ask);
+          log.debug({ 
+            asset: pc.asset_id.substring(0, 20) + '...', 
+            bb: bid.toFixed(4), 
+            ba: ask.toFixed(4),
+            spread: (spread! * 100).toFixed(1) + '¢'
+          }, "💹 price_change");
+        }
+        break;
+        
+      case "tick_size_change":
+        // Mettre à jour le tick_size dynamique
+        const newTickSize = Number(msg.new_tick_size);
+        if (newTickSize > 0 && newTickSize <= 1) {
+          this.tickSizes.set(msg.asset_id, newTickSize);
+          log.info({ 
+            asset: msg.asset_id.substring(0, 20) + '...', 
+            newTickSize 
+          }, "📏 tick_size_change");
+        }
+        break;
+    }
+  }
+
+  private updateTop(assetId: string, bid: number, ask: number) {
+    // Mettre à jour le cache (source de vérité)
+    this.lastPrices.set(assetId, { bestBid: bid, bestAsk: ask });
+    
+    // Mettre à jour le timestamp de dernière activité
+    this.lastPriceUpdateTime.set(assetId, Date.now());
+    
+    // Notifier les listeners
+    this.listeners.get(assetId)?.(bid, ask);
+    
+    // Log seulement si le prix a changé (anti-spam)
+    const prev = this.lastPriceLogs.get(assetId);
+    if (!prev || prev.bid !== bid || prev.ask !== ask) {
+      log.debug({ asset_id: assetId, best_bid: bid, best_ask: ask }, "price update");
+      this.lastPriceLogs.set(assetId, { bid, ask });
+    }
+  }
   
   getLastPrices(tokenId: string): { bestBid: number|null, bestAsk: number|null } | null {
     return this.lastPrices.get(tokenId) || null;
+  }
+
+  /**
+   * Récupère le tick_size pour un token donné
+   * Retourne null si pas encore connu (utiliser DEFAULT_TICK_SIZE en fallback)
+   */
+  getTickSize(tokenId: string): number | null {
+    return this.tickSizes.get(tokenId) || null;
+  }
+
+  /**
+   * Définit le tick_size pour un token (depuis /book ou autre source)
+   */
+  setTickSize(tokenId: string, tickSize: number): void {
+    if (tickSize > 0 && tickSize <= 1) {
+      this.tickSizes.set(tokenId, tickSize);
+    }
   }
 
   /**
@@ -81,22 +222,24 @@ export class MarketFeed {
       this.isConnecting = false;
       this.reconnectAttempts = 0; // Reset counter on successful connection
       
-      // Attendre un peu que la connexion soit complètement établie
-      setTimeout(() => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          // Format de souscription qui fonctionne selon nos tests
-          const sub = { type: "MARKET", assets_ids: tokenIds };
-          this.ws.send(JSON.stringify(sub));
-          
-          this.ping = setInterval(()=> {
-            if (this.ws?.readyState === WebSocket.OPEN) {
-              this.ws.ping();
-            }
-          }, 10_000);
-          
-          log.info({ tokenIds }, "WSS connected & subscribed");
+      // Keepalive propre (évite messages texte)
+      let lastPong = Date.now();
+      this.ws!.on("pong", () => { lastPong = Date.now(); });
+      
+      this.ping = setInterval(() => {
+        if (Date.now() - lastPong > 30000) { 
+          this.ws!.terminate(); 
+          return; 
         }
-      }, 100);
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.ping();
+        }
+      }, 10000);
+      
+      log.info({ tokenIds }, "WSS connected");
+      
+      // CORRECTIF: Envoyer la souscription dès l'ouverture (et à chaque reconnect)
+      this.flushSubscription();
     });
 
     this.ws.on("pong", () => {
@@ -105,80 +248,19 @@ export class MarketFeed {
 
     this.ws.on("message", (buf) => {
         try {
-          const data = buf.toString();
+          const txt = buf.toString();
           
-          // Gérer les messages PONG
-          if (data === "PONG") {
-            return;
+          // Filtrer PING/PONG avant JSON.parse
+          if (txt === "PING" || txt === "PONG") return; // ne pas parser
+          
+          let msg: any;
+          try { 
+            msg = JSON.parse(txt); 
+          } catch { 
+            return; 
           }
           
-          const msg = JSON.parse(data);
-          
-          // Gérer les messages de marché (format observé dans nos tests)
-          if (msg.market && msg.price_changes && Array.isArray(msg.price_changes)) {
-            for (const pc of msg.price_changes as PriceUpdate[]) {
-              const bb = pc.best_bid != null ? Number(pc.best_bid) : null;
-              const ba = pc.best_ask != null ? Number(pc.best_ask) : null;
-              
-              // Mettre à jour le cache (source de vérité)
-              this.lastPrices.set(pc.asset_id, { bestBid: bb, bestAsk: ba });
-              
-              // Mettre à jour le timestamp de dernière activité
-              this.lastPriceUpdateTime.set(pc.asset_id, Date.now());
-              
-              // Notifier les listeners
-              this.listeners.get(pc.asset_id)?.(bb,ba);
-              
-              // Log seulement si le prix a changé (anti-spam)
-              const prev = this.lastPriceLogs.get(pc.asset_id);
-              if (!prev || prev.bid !== bb || prev.ask !== ba) {
-                log.debug({ asset_id: pc.asset_id, best_bid: bb, best_ask: ba }, "price update");
-                this.lastPriceLogs.set(pc.asset_id, { bid: bb, ask: ba });
-              }
-            }
-          } else if (msg.event_type === "book") {
-            const asset = msg.asset_id;
-            const bb = msg.bids?.length ? Number(msg.bids[0].price) : null;
-            const ba = msg.asks?.length ? Number(msg.asks[0].price) : null;
-            
-            // FILTRE CRITIQUE: Ignorer les données book corrompues
-            // Les données book avec bid=0.001 et ask=0.999 sont des valeurs par défaut incorrectes
-            const isCorruptedData = (bb === 0.001 && ba === 0.999) || 
-                                   (bb === 0.001 && ba === null) || 
-                                   (bb === null && ba === 0.999);
-            
-            if (isCorruptedData) {
-              log.warn({ 
-                asset_id: asset, 
-                best_bid: bb, 
-                best_ask: ba, 
-                reason: "Corrupted book data detected" 
-              }, "Ignoring corrupted book snapshot");
-              return;
-            }
-            
-            // Seulement utiliser les données book si elles semblent valides
-            if (bb !== null && ba !== null && bb < ba && bb > 0 && ba < 1) {
-              const current = this.lastPrices.get(asset) || { bestBid: null, bestAsk: null };
-              this.lastPrices.set(asset, { 
-                bestBid: bb, 
-                bestAsk: ba 
-              });
-              
-              // Mettre à jour le timestamp de dernière activité
-              this.lastPriceUpdateTime.set(asset, Date.now());
-              
-              this.listeners.get(asset)?.(bb, ba);
-              log.info({ asset_id: asset, best_bid: bb, best_ask: ba, source: "book+validated" }, "book snapshot");
-            } else {
-              log.debug({ 
-                asset_id: asset, 
-                best_bid: bb, 
-                best_ask: ba, 
-                reason: "Invalid book data (bb >= ba or out of range)" 
-              }, "Ignoring invalid book snapshot");
-            }
-          }
+          this.handleMessage(msg);
         } catch(e) { 
           log.warn({ e, data: buf.toString().substring(0, 100) }, "WS parse error"); 
         }
@@ -248,4 +330,5 @@ export class MarketFeed {
     this.reconnectAttempts = 0;
     log.info("WebSocket disconnected");
   }
+
 }
