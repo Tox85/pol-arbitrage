@@ -2,8 +2,7 @@
 
 Bot de market-making pour Polymarket avec gestion des risques stricte et retrait immédiat.
 
-**Version :** 2.1  
-**Status :** ✅ Testé et validé (7min sans crash, globalAtRisk stable)
+
 
 ---
 
