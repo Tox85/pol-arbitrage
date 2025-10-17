@@ -11,3 +11,6 @@ coverage
 .env.test.local
 .env.production.local
 *.log
+.npm
+.npm-cache
+node_modules/.cache
